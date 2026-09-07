@@ -6,6 +6,7 @@ use "../src/lib.vani";
 
 fn main() -> i64 {
   assert netstack_filter_self_test() == 1;
-  print "netstack: packet filter self-test PASS";
+  assert netstack_arp_self_test() == 1;
+  print "netstack: packet filter + ARP self-tests PASS";
   return 0;
 }
