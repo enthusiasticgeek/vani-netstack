@@ -9,6 +9,7 @@ fn main() -> i64 {
   assert netstack_arp_self_test() == 1;
   assert netstack_ipv4_self_test() == 1;
   assert netstack_udp_self_test() == 1;
-  print "netstack: packet filter + ARP + IPv4 + UDP self-tests PASS";
+  assert netstack_dhcp_self_test() == 1;
+  print "netstack: packet filter + ARP + IPv4 + UDP + DHCP self-tests PASS";
   return 0;
 }
