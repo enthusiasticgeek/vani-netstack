@@ -1,10 +1,10 @@
 [package]
 name        = "netstack"
-version     = "0.5.0"
+version     = "0.6.0"
 entry       = "src/lib.vani"
 authors     = "enthusiasticgeek"
 license     = "Apache-2.0"
-description = "Hardware-agnostic network protocol stack (packet filter, ARP, IPv4, UDP, TCP, DHCP -- growing incrementally), pure vani, heap-free. Every stateful subsystem is a plain value-type struct threaded through pure functions, no persistent extern state inside the package -- each board keeps its own storage and round-trips it through. Extracted from DhruvaOS's Pi 1/Pi 4/5 ports so any consumer, including future non-RPi boards, can share one implementation. v0.5.0: packet filter + ARP + IPv4 (standalone 20-byte header codec) + UDP (streaming checksum, 8-byte header codec) + DHCP (BOOTP header/options build-parse + 4-slot server lease table)."
+description = "Hardware-agnostic network protocol stack (packet filter, ARP, IPv4, UDP, TCP, DHCP -- growing incrementally), pure vani, heap-free. Every stateful subsystem is a plain value-type struct threaded through pure functions, no persistent extern state inside the package -- each board keeps its own storage and round-trips it through. Extracted from DhruvaOS's Pi 1/Pi 4/5 ports so any consumer, including future non-RPi boards, can share one implementation. v0.6.0: packet filter + ARP + IPv4 (standalone 20-byte header codec) + UDP (streaming checksum, 8-byte header codec) + DHCP (BOOTP header/options build-parse + 4-slot server lease table) + TCP (standalone 20-byte header codec + streaming checksum, reusing UDP's own checksum-update accumulator). Networking-generification effort CLOSED -- connection state machines stay board-specific."
 registry    = "kosh"
 
 [deps]
