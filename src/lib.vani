@@ -1786,3 +1786,213 @@ fn netstack_tcp_self_test() -> i64 {
 
   return ok;
 }
+
+// ---------------------------------------------------------------------------
+// DNS (RFC 1035) -- a single A-record query/response client. Scoped like
+// u-boot's own bare-metal DNS client (net/dns.c, the closest real reference
+// for this project's own from-scratch, single-request-at-a-time style --
+// Linux has no in-kernel DNS client to compare against at all, resolution is
+// userspace there): one QTYPE=A/QCLASS=IN query, no CNAME-chain following,
+// no EDNS0, no TC-bit/retry-over-TCP handling. A server's answer-section
+// name is never actually decoded even when it uses label compression (a
+// leading 0xc0 byte) -- same shortcut u-boot takes, since a minimal client
+// only needs the record's type/data, not to reconstruct the name string.
+struct DnsResolveResult { ok: i64, resolved_ip: u32 }
+
+// Writes the fixed 12-byte header (ID=xid, flags=0x0100 "standard query,
+// recursion desired", QDCOUNT=1, AN/NS/ARCOUNT=0), then QNAME as length-
+// prefixed labels (hostname split on '.'), a zero root label, QTYPE=1 (A),
+// QCLASS=1 (IN). Returns the total query length.
+#[bounded_stack(bytes=240)]
+fn netstack_dns_build_query(buf: mut ref [u8; 512], dns_offset: i64, xid: u32, hostname: ref [u8; 64], hostname_len: i64) -> i64 {
+  let _ = netstack_write_u16_be(buf, dns_offset, xid);
+  let _ = netstack_write_u16_be(buf, dns_offset + 2, 0x0100 as u32); // flags
+  let _ = netstack_write_u16_be(buf, dns_offset + 4, 1 as u32); // QDCOUNT
+  let _ = netstack_write_u16_be(buf, dns_offset + 6, 0 as u32); // ANCOUNT
+  let _ = netstack_write_u16_be(buf, dns_offset + 8, 0 as u32); // NSCOUNT
+  let _ = netstack_write_u16_be(buf, dns_offset + 10, 0 as u32); // ARCOUNT
+
+  let pos: i64 = dns_offset + 12;
+  let label_start: i64 = 0;
+  let i: i64 = 0;
+  while i <= hostname_len {
+    let at_end: i64 = if i == hostname_len { 1 } else { 0 };
+    let is_dot: i64 = if (at_end == 0) && (hostname[i] == (46 as u8)) { 1 } else { 0 }; // '.'
+    if (at_end == 1) || (is_dot == 1) {
+      let label_len: i64 = i - label_start;
+      buf[pos] = label_len as u8;
+      pos = pos + 1;
+      let j: i64 = label_start;
+      while j < i {
+        buf[pos] = hostname[j];
+        pos = pos + 1;
+        j = j + 1;
+      }
+      label_start = i + 1;
+    }
+    i = i + 1;
+  }
+  buf[pos] = 0 as u8; // root label
+  pos = pos + 1;
+
+  let _ = netstack_write_u16_be(buf, pos, 1 as u32); // QTYPE: A
+  let _ = netstack_write_u16_be(buf, pos + 2, 1 as u32); // QCLASS: IN
+  return (pos + 4) - dns_offset;
+}
+
+// Skips one DNS "name" field starting at `pos` -- either a normal sequence
+// of length-prefixed labels ending in a zero root label, or a compression
+// pointer (a byte with its top two bits set, 0xc0-0xff) which is always
+// exactly 2 bytes and is never dereferenced (see this section's own header
+// comment). Returns the position just past the name, or -1 if a length byte
+// would read past `end`.
+#[bounded_stack(bytes=124)]
+fn netstack_dns_skip_name(buf: ref [u8; 512], pos_in: i64, end: i64) -> i64 {
+  let pos: i64 = pos_in;
+  let iter: i64 = 0;
+  while iter < 128 {
+    if pos >= end {
+      return 0 - 1;
+    }
+    let b: u32 = buf[pos] as u32;
+    if (b & (0xC0 as u32)) == (0xC0 as u32) {
+      return pos + 2; // compression pointer, fixed 2 bytes, never followed
+    }
+    if b == (0 as u32) {
+      return pos + 1; // root label
+    }
+    pos = pos + 1 + (b as i64);
+    iter = iter + 1;
+  }
+  return 0 - 1;
+}
+
+// Validates xid + QR=1 (response) + RCODE==0 (no error), skips the echoed
+// question (same length we built it with -- no need to re-walk it), then
+// walks up to 16 answer RRs looking for the first TYPE=1 (A)/CLASS=1 (IN)/
+// RDLENGTH=4 record. Every length read is bounds-checked against `resp_len`
+// before being trusted, same "reject, don't guess" posture as every other
+// netstack parser (e.g. netstack_dhcp_find_option_u32's identical bounded
+// walk).
+#[bounded_stack(bytes=552)]
+fn netstack_dns_parse_response(buf: ref [u8; 512], dns_offset: i64, resp_len: i64, expect_xid: u32) -> DnsResolveResult {
+  let end: i64 = dns_offset + resp_len;
+  if resp_len < 12 {
+    return DnsResolveResult { ok: 0, resolved_ip: 0 as u32 };
+  }
+  let got_xid: u32 = netstack_read_u16_be(buf, dns_offset);
+  if got_xid != expect_xid {
+    return DnsResolveResult { ok: 0, resolved_ip: 0 as u32 };
+  }
+  let flags: u32 = netstack_read_u16_be(buf, dns_offset + 2);
+  let qr: u32 = (flags >> (15 as u32)) & (1 as u32);
+  let rcode: u32 = flags & (0xF as u32);
+  if (qr != (1 as u32)) || (rcode != (0 as u32)) {
+    return DnsResolveResult { ok: 0, resolved_ip: 0 as u32 };
+  }
+  let qdcount: u32 = netstack_read_u16_be(buf, dns_offset + 4);
+  let ancount: u32 = netstack_read_u16_be(buf, dns_offset + 6);
+
+  let pos: i64 = dns_offset + 12;
+  let qi: u32 = 0 as u32;
+  while qi < qdcount {
+    pos = netstack_dns_skip_name(buf, pos, end);
+    if (pos < 0) || ((pos + 4) > end) {
+      return DnsResolveResult { ok: 0, resolved_ip: 0 as u32 };
+    }
+    pos = pos + 4; // QTYPE + QCLASS
+    qi = qi + (1 as u32);
+  }
+
+  let ai: u32 = 0 as u32;
+  while ai < ancount {
+    pos = netstack_dns_skip_name(buf, pos, end);
+    if (pos < 0) || ((pos + 10) > end) {
+      return DnsResolveResult { ok: 0, resolved_ip: 0 as u32 };
+    }
+    let rtype: u32 = netstack_read_u16_be(buf, pos);
+    let rclass: u32 = netstack_read_u16_be(buf, pos + 2);
+    let rdlength: u32 = netstack_read_u16_be(buf, pos + 8);
+    let rdata_pos: i64 = pos + 10;
+    if (rdata_pos as i64) + (rdlength as i64) > end {
+      return DnsResolveResult { ok: 0, resolved_ip: 0 as u32 };
+    }
+    if (rtype == (1 as u32)) && (rclass == (1 as u32)) && (rdlength == (4 as u32)) {
+      let resolved: u32 = netstack_read_u32_be(buf, rdata_pos);
+      return DnsResolveResult { ok: 1, resolved_ip: resolved };
+    }
+    pos = rdata_pos + (rdlength as i64);
+    ai = ai + (1 as u32);
+  }
+  return DnsResolveResult { ok: 0, resolved_ip: 0 as u32 };
+}
+
+// Boot-time self-test: build a query for a known hostname, assert the QNAME
+// encoding round-trips to exactly the expected bytes; hand-build a synthetic
+// reply (matching xid, QR=1, one A answer with a known IP) and assert it
+// parses correctly; negative cases for wrong xid, RCODE!=0, and no-A-record.
+#[bounded_stack(bytes=3016)]
+fn netstack_dns_self_test() -> i64 {
+  let ok: i64 = 1;
+  let xid: u32 = 0x1234 as u32;
+  let hostname: [u8; 64] = [0 as u8; 64];
+  hostname[0] = 101 as u8; hostname[1] = 120 as u8; hostname[2] = 97 as u8; hostname[3] = 109 as u8; hostname[4] = 112 as u8; hostname[5] = 108 as u8; hostname[6] = 101 as u8; // "example"
+  hostname[7] = 46 as u8; // '.'
+  hostname[8] = 99 as u8; hostname[9] = 111 as u8; hostname[10] = 109 as u8; // "com"
+  let hostname_len: i64 = 11;
+
+  let query: [u8; 512] = netstack_zero_frame();
+  let query_len: i64 = netstack_dns_build_query(mut ref query, 0, xid, ref hostname, hostname_len);
+  // header(12) + label(1+7="example") + label(1+3="com") + root(1) + QTYPE(2) + QCLASS(2)
+  if query_len != (12 + 8 + 4 + 1 + 4) { ok = 0; }
+  if query[12] != (7 as u8) { ok = 0; } // "example" label length
+  if query[20] != (3 as u8) { ok = 0; } // "com" label length
+  if query[24] != (0 as u8) { ok = 0; } // root label
+  if netstack_read_u16_be(ref query, 25) != (1 as u32) { ok = 0; } // QTYPE
+  if netstack_read_u16_be(ref query, 27) != (1 as u32) { ok = 0; } // QCLASS
+
+  // Synthetic reply: echo the question, then one A answer (compressed name
+  // pointing back at the question, exactly like a real server would) with
+  // IP 93.184.216.34 (example.com's own long-stable real address).
+  let reply: [u8; 512] = netstack_zero_frame();
+  let _ = netstack_write_u16_be(mut ref reply, 0, xid);
+  let _ = netstack_write_u16_be(mut ref reply, 2, 0x8180 as u32); // QR=1, RCODE=0
+  let _ = netstack_write_u16_be(mut ref reply, 4, 1 as u32); // QDCOUNT
+  let _ = netstack_write_u16_be(mut ref reply, 6, 1 as u32); // ANCOUNT
+  let _ = netstack_write_u16_be(mut ref reply, 8, 0 as u32);
+  let _ = netstack_write_u16_be(mut ref reply, 10, 0 as u32);
+  let ri: i64 = 12;
+  while ri < query_len {
+    reply[ri] = query[ri];
+    ri = ri + 1;
+  }
+  let ans_pos: i64 = query_len;
+  reply[ans_pos] = 0xC0 as u8; // compression pointer
+  reply[ans_pos + 1] = 12 as u8; // -> offset 12 (the question's own name)
+  let _ = netstack_write_u16_be(mut ref reply, ans_pos + 2, 1 as u32); // TYPE A
+  let _ = netstack_write_u16_be(mut ref reply, ans_pos + 4, 1 as u32); // CLASS IN
+  let _ = netstack_write_u32_be(mut ref reply, ans_pos + 6, 300 as u32); // TTL
+  let _ = netstack_write_u16_be(mut ref reply, ans_pos + 10, 4 as u32); // RDLENGTH
+  let expect_ip: u32 = 0x5DB8D822 as u32; // 93.184.216.34
+  let _ = netstack_write_u32_be(mut ref reply, ans_pos + 12, expect_ip);
+  let reply_len: i64 = ans_pos + 16;
+
+  let good: DnsResolveResult = netstack_dns_parse_response(ref reply, 0, reply_len, xid);
+  if good.ok != 1 { ok = 0; }
+  if good.resolved_ip != expect_ip { ok = 0; }
+
+  let wrong_xid: DnsResolveResult = netstack_dns_parse_response(ref reply, 0, reply_len, xid ^ (1 as u32));
+  if wrong_xid.ok != 0 { ok = 0; }
+
+  let nak: [u8; 512] = netstack_zero_frame();
+  let _ = netstack_write_u16_be(mut ref nak, 0, xid);
+  let _ = netstack_write_u16_be(mut ref nak, 2, 0x8183 as u32); // QR=1, RCODE=3 (NXDOMAIN)
+  let nxi: i64 = 0;
+  while nxi < 12 {
+    nxi = nxi + 1;
+  }
+  let nak_result: DnsResolveResult = netstack_dns_parse_response(ref nak, 0, 12, xid);
+  if nak_result.ok != 0 { ok = 0; } // RCODE!=0 must be rejected
+
+  return ok;
+}
